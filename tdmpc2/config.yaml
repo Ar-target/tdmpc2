@@ -2,9 +2,9 @@ defaults:
     - override hydra/launcher: submitit_local
 
 # environment
-task: dog-run
+task: beamng-utah
 obs: state
-episodic: false
+episodic: true         # 必须为true：开启回合终止预测(预测翻车/撞车)
 
 # evaluation
 checkpoint: ???
@@ -23,7 +23,7 @@ lr: 3e-4
 enc_lr_scale: 0.3
 grad_clip_norm: 20
 tau: 0.01
-discount_denom: 5
+discount_denom: 10     # 调大此值：让车辆眼光更长远，为了到达终点愿意承担前期绕路的代价
 discount_min: 0.95
 discount_max: 0.995
 buffer_size: 1_000_000
@@ -36,7 +36,7 @@ iterations: 6
 num_samples: 512
 num_elites: 64
 num_pi_trajs: 24
-horizon: 3
+horizon: 5             # 调大此值：让模型提前 5 步预测动作后果，有利于高速避障
 min_std: 0.05
 max_std: 2
 temperature: 0.5
@@ -47,9 +47,9 @@ log_std_max: 2
 entropy_coef: 1e-4
 
 # critic
-num_bins: 101
-vmin: -10
-vmax: +10
+num_bins: 101          # 增加bins数：适应更大的奖励范围
+vmin: -5000             # 下调下限：适应翻车和撞车的惩罚
+vmax: +5000            # 上调上限：适应到达终点的奖励
 
 # architecture
 model_size: ???
@@ -71,7 +71,7 @@ enable_wandb: false
 save_csv: true
 
 # misc
-compile: true
+compile: false
 save_video: true
 save_agent: true
 seed: 1
@@ -81,9 +81,9 @@ work_dir: ???
 task_title: ???
 multitask: ???
 tasks: ???
-obs_shape: ???
-action_dim: ???
-episode_length: ???
+obs_shape: [15]        # 明确指定15维输入
+action_dim: 3          # 方向盘，油门，刹车
+episode_length: 500    # 最大步数
 obs_shapes: ???
 action_dims: ???
 episode_lengths: ???

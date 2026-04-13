@@ -19,9 +19,6 @@ warnings.filterwarnings('ignore', category=DeprecationWarning)
 
 
 def make_multitask_env(cfg):
-	"""
-	Make a multi-task environment for TD-MPC2 experiments.
-	"""
 	print('Creating multi-task environment with tasks:', cfg.tasks)
 	envs = []
 	for task in cfg.tasks:
@@ -40,9 +37,6 @@ def make_multitask_env(cfg):
 
 
 def make_env(cfg):
-	"""
-	Make an environment for TD-MPC2 experiments.
-	"""
 	gym.logger.set_level(40)
 	if cfg.multitask:
 		env = make_multitask_env(cfg)
