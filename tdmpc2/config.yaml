@@ -1,57 +1,86 @@
 defaults:
     - override hydra/launcher: submitit_local
 
+# ============================================================
 # environment
+# ============================================================
 task: beamng-utah
 obs: state
-episodic: true         # 必须为true：开启回合终止预测(预测翻车/撞车)
+episodic: true          # 开启回合终止预测
 
+# ============================================================
 # evaluation
+# ============================================================
 checkpoint: ???
 eval_episodes: 10
 eval_freq: 50000
 
+# ============================================================
 # training
+# ============================================================
 steps: 10_000_000
 batch_size: 256
-reward_coef: 0.1
-value_coef: 0.1
-termination_coef: 1
-consistency_coef: 20
+
+# [修改] 损失系数：原来 consistency:reward:value = 200:1:1，严重压制奖励信号
+# 参考 TD-MPC2 论文默认值调整为合理比例
+consistency_coef: 20     # 原值: 20
+reward_coef: 0.1        # 原值: 0.1
+value_coef: 0.1         # 原值: 0.1
+
+# [修改] 降低termination_coef：早期几乎每个episode都碰撞终止，
+# termination predictor容易学成"总是预测终止"，破坏value estimation
+termination_coef: 0.1   # 原值: 1
+
 rho: 0.5
 lr: 3e-4
 enc_lr_scale: 0.3
 grad_clip_norm: 20
 tau: 0.01
-discount_denom: 10     # 调大此值：让车辆眼光更长远，为了到达终点愿意承担前期绕路的代价
-discount_min: 0.95
-discount_max: 0.995
+discount_denom: 10
+discount_min: 0.97
+discount_max: 0.999
 buffer_size: 1_000_000
 exp_name: default
 data_dir: ???
 
+# ============================================================
 # planning
+# ============================================================
 mpc: true
+
+# MPPI迭代次数
 iterations: 6
+
 num_samples: 512
 num_elites: 64
 num_pi_trajs: 24
-horizon: 5             # 调大此值：让模型提前 5 步预测动作后果，有利于高速避障
+
+# horizon
+horizon: 6
+
 min_std: 0.05
 max_std: 2
-temperature: 0.5
+temperature: 1.0
 
+# ============================================================
 # actor
+# ============================================================
 log_std_min: -10
 log_std_max: 2
-entropy_coef: 1e-4
+entropy_coef: 1e-3
 
+# ============================================================
 # critic
-num_bins: 101          # 增加bins数：适应更大的奖励范围
-vmin: -5000             # 下调下限：适应翻车和撞车的惩罚
-vmax: +5000            # 上调上限：适应到达终点的奖励
+# ============================================================
+num_bins: 101
 
+# [修改] vmin/vmax 与实际奖励范围对齐
+vmin: -5
+vmax: 80
+
+# ============================================================
 # architecture
+# ============================================================
 model_size: ???
 num_enc_layers: 2
 enc_dim: 256
@@ -63,40 +92,57 @@ num_q: 5
 dropout: 0.01
 simnorm_dim: 8
 
+# ============================================================
 # logging
+# ============================================================
 wandb_project: ???
 wandb_entity: ???
 wandb_silent: false
-enable_wandb: false
+enable_wandb: true
 save_csv: true
 
+# ============================================================
 # misc
+# ============================================================
 compile: false
-save_video: true
+save_video: false
 save_agent: true
 seed: 1
 
+# ============================================================
 # convenience
+# ============================================================
 work_dir: ???
 task_title: ???
 multitask: ???
 tasks: ???
-obs_shape: [15]        # 明确指定15维输入
-action_dim: 3          # 方向盘，油门，刹车
-episode_length: 500    # 最大步数
+
+# [修改] 观测维度从15改为14（去掉绝对坐标pos，新增speed和heading_dot）
+obs_shape: [18]        
+action_dim: 3           # 方向盘，油门，刹车
+episode_length: 500
+
 obs_shapes: ???
 action_dims: ???
 episode_lengths: ???
-seed_steps: ???
+
+# [修改] 必须设置seed_steps，不能为???
+# 先用随机数据填充buffer再开始训练
+seed_steps: 5000        # 原值: ???
+
 bin_size: ???
 
+# ============================================================
 # BeamNG 连接
+# ============================================================
 beamng_host: localhost
 beamng_port: 64256
 beamng_home: /workspace/src/BeamNGtech
 
+# ============================================================
 # 场景设置
+# ============================================================
 map: utah
-vehicle_model: pickup
-start_pos: [-329.203, -479.988, 133.219]
+vehicle_model: rockbouncer
+start_pos: [-87.13, -280.64, 136.88]
 start_rot: [0.0, 0.0, 0.0, 1.0]

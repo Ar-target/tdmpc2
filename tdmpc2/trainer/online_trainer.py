@@ -98,6 +98,13 @@ class OnlineTrainer(Trainer):
 						episode_terminated=info['terminated'])
 					train_metrics.update(self.common_metrics())
 					self.logger.log(train_metrics, 'train')
+					print(
+						f"[Step {self._step}] "
+						f"Ep {self._ep_idx} | "
+						f"Reward: {train_metrics['episode_reward']:.1f} | "
+						f"Length: {train_metrics['episode_length']} | "
+						f"Terminated: {train_metrics['episode_terminated']}"
+					)
 					self._ep_idx = self.buffer.add(torch.cat(self._tds))
 
 				obs = self.env.reset()
@@ -107,8 +114,12 @@ class OnlineTrainer(Trainer):
 			if self._step > self.cfg.seed_steps:
 				action = self.agent.act(obs, t0=len(self._tds)==1)
 			else:
-				action = self.env.rand_act()
+				if hasattr(self.env.unwrapped, 'seed_action'):
+					action = torch.tensor(self.env.unwrapped.seed_action(), dtype=torch.float32)
+				else:
+					action = self.env.rand_act()
 			obs, reward, done, info = self.env.step(action)
+			print(f"DEBUG | Action: {action} | Reward: {reward:.3f} | Done: {done} | Speed: {info.get('speed', 'N/A')}")
 			self._tds.append(self.to_td(obs, action, reward, info['terminated']))
 
 			# Update agent
