@@ -11,8 +11,8 @@ from envs.wrappers.timeout import Timeout
 # 状态维度: pos(3) + vel(3) + dir(3) + up(3) + rel_goal(3) + next_rel_goal(3)
 OBS_DIM = 18
 
-# 动作维度：steering, throttle, brake
-ACT_DIM = 3
+# 动作维度：steering, acc_pedal (目标加速度踏板：正为油门，负为刹车)
+ACT_DIM = 2
 
 
 def get_obs_from_state(
@@ -30,7 +30,7 @@ def get_obs_from_state(
 
 
 # ---------------------------------------------------------------------------
-# OU 噪声：用于 seed 阶段生成时间相关的平滑随机动作，比纯均匀随机更接近真实驾驶
+# OU 噪声：用于 seed 阶段生成时间相关的平滑随机动作
 # ---------------------------------------------------------------------------
 class OUNoise:
     def __init__(self, action_dim: int, mu: float = 0.0,
@@ -52,7 +52,7 @@ class OUNoise:
 
 class BeamNGWrapper:
 
-    # seed 阶段的子策略列表，每隔 EXPLORE_SWITCH_STEPS 步随机切换一次
+    # seed 阶段的子策略列表
     _EXPLORE_MODES       = ['straight', 'turn_left', 'turn_right', 'brake']
     EXPLORE_SWITCH_STEPS = 20
 
@@ -73,7 +73,7 @@ class BeamNGWrapper:
         self.wp_radius     = wp_data.get('waypoint_reach_radius', 4.0)
         self.num_waypoints = len(self.waypoints)
 
-        # ── 2. 追踪进度（车辆初始生成在 WP 0，目标直接设为 WP 1）──────────
+        # ── 2. 追踪进度 ──────────────────────────────────────────
         self.current_wp_index = 1
 
         # ── 3. 启动 BeamNG ───────────────────────────────────────────────
@@ -87,20 +87,22 @@ class BeamNGWrapper:
 
         # ── 4. 状态追踪变量 ───────────────────────────────────────────────
         self._prev_damage = 0.0
-        self.prev_dist    = None   # 上一帧到当前目标航点的距离
+        self.prev_dist    = None   
+        self.current_step_count = 0
+        self.stuck_counter = 0
 
         # ── 5. seed 阶段探索辅助 ──────────────────────────────────────────
         self._ou_noise        = OUNoise(ACT_DIM)
         self._explore_mode    = 'straight'
         self._explore_counter = 0
 
-        # ── 6. 空间定义 ───────────────────────────────────────────────────
+        # ── 6. 空间定义 (2D 动作空间) ────────────────────────────
         self.observation_space = gym.spaces.Box(
             low=-np.inf, high=np.inf, shape=(OBS_DIM,), dtype=np.float32
         )
         self.action_space = gym.spaces.Box(
-            low =np.array([-1.0, 0.0, 0.0], dtype=np.float32),
-            high=np.array([ 1.0, 1.0, 1.0], dtype=np.float32),
+            low =np.array([-1.0, -1.0], dtype=np.float32), 
+            high=np.array([ 1.0,  1.0], dtype=np.float32), 
             dtype=np.float32,
         )
 
@@ -126,7 +128,6 @@ class BeamNGWrapper:
         self.bng.pause()
 
     def _get_current_targets(self):
-        """返回 (当前目标航点, 前瞻航点)"""
         target   = self.waypoints[self.current_wp_index]
         next_idx = min(self.current_wp_index + 1, self.num_waypoints - 1)
         return target, self.waypoints[next_idx]
@@ -147,23 +148,18 @@ class BeamNGWrapper:
         return self.bng
 
     def seed_action(self) -> np.ndarray:
-        """
-        seed 阶段专用的结构化随机动作：
-        每 EXPLORE_SWITCH_STEPS 步切换一次子策略，叠加 OU 噪声保证平滑多样性。
-        保证油门偏大，车辆真正能跑起来，覆盖更多状态空间。
-        """
         self._explore_counter += 1
         if self._explore_counter % self.EXPLORE_SWITCH_STEPS == 0:
             self._explore_mode = np.random.choice(self._EXPLORE_MODES)
 
         mode_actions = {
-            'straight'  : np.array([ 0.0, 0.8, 0.0], dtype=np.float32),
-            'turn_left' : np.array([-0.4, 0.6, 0.0], dtype=np.float32),
-            'turn_right': np.array([ 0.4, 0.6, 0.0], dtype=np.float32),
-            'brake'     : np.array([ 0.0, 0.0, 0.8], dtype=np.float32),
+            'straight'  : np.array([ 0.0,  0.8], dtype=np.float32),
+            'turn_left' : np.array([-0.4,  0.6], dtype=np.float32),
+            'turn_right': np.array([ 0.4,  0.6], dtype=np.float32),
+            'brake'     : np.array([ 0.0, -0.8], dtype=np.float32),
         }
         base  = mode_actions[self._explore_mode]
-        noise = self._ou_noise.sample() * np.array([0.2, 0.1, 0.05], dtype=np.float32)
+        noise = self._ou_noise.sample() * np.array([0.2, 0.1], dtype=np.float32)
         action = np.clip(base + noise,
                          self.action_space.low,
                          self.action_space.high)
@@ -173,14 +169,18 @@ class BeamNGWrapper:
         self.bng.restart_scenario()
         self.bng.pause()
 
-        # 重置所有状态追踪变量
-        self._prev_damage     = 0.0
-        self.current_wp_index = 1
-        self._ou_noise.reset()
-        self._explore_counter = 0
-        self._explore_mode    = 'straight'
+        # 强制挂入 1 档（越野推荐）或 D 档，踩死刹车，等待齿轮咬合
+        self.vehicle.control(gear=1, throttle=0.0, brake=1.0, parkingbrake=0.0)
+        self.bng.step(60) 
 
-        # 初始化 prev_dist，避免第一步 step() 出现 None - float 报错
+        self._prev_damage       = 0.0
+        self.current_wp_index   = 1
+        self._ou_noise.reset()
+        self._explore_counter   = 0
+        self._explore_mode      = 'straight'
+        self.current_step_count = 0  
+        self.stuck_counter      = 0
+
         self.vehicle.sensors.poll()
         pos             = np.array(self.vehicle.state['pos'], dtype=np.float32)
         target, _       = self._get_current_targets()
@@ -189,126 +189,128 @@ class BeamNGWrapper:
         return self._get_obs()
 
     def step(self, action: np.ndarray):
-        # ── 动作 clip，防止越界传入 BeamNG ──────────────────────────────
-        steering = float(np.clip(action[0], -1.0,  1.0))
-        raw_throttle = float(np.clip(action[1],  0.0,  1.0))
-        raw_brake    = float(np.clip(action[2],  0.0,  1.0))
+        self.current_step_count += 1
+        
+        # ── 1D 踏板解析 ──
+        steering = float(np.clip(action[0], -1.0, 1.0))
+        pedal    = float(np.clip(action[1], -1.0, 1.0))
 
-        if raw_throttle > raw_brake:
-            throttle, brake = raw_throttle, 0.0
+        if pedal > 0:
+            throttle = pedal
+            brake    = 0.0
         else:
-            throttle, brake = 0.0, raw_brake
+            throttle = 0.0
+            brake    = -pedal 
 
         reward = 0.0
         done   = False
-        info   = defaultdict(float)
+        info   = {}
 
-        V_REF = 20.0  # 参考速度（m/s），用于速度奖励归一化
+        V_REF = 20.0 
 
-        # 同一个动作连续执行 2 个仿真步
-        for _ in range(2):
-            self.vehicle.control(steering=steering, throttle=throttle, brake=brake)
-            self.bng.step(1)
-            self.vehicle.sensors.poll()
+        # ── 10Hz 控制频率 (0.1秒物理步长) ──
+        # 有效过滤探索早期的纯随机高频噪声
+        self.vehicle.control(steering=steering, throttle=throttle, brake=brake)
+        self.bng.step(50)  
+        self.vehicle.sensors.poll()
 
-            state       = self.vehicle.state
-            damage_data = self.vehicle.sensors['damage']
-            pos         = np.array(state['pos'], dtype=np.float32)
-            vel         = np.array(state['vel'], dtype=np.float32)
-            direction   = np.array(state['dir'], dtype=np.float32)
-            up          = np.array(state['up'],  dtype=np.float32)
-            current_speed = np.linalg.norm(vel)
+        state       = self.vehicle.state
+        damage_data = self.vehicle.sensors['damage']
+        pos         = np.array(state['pos'], dtype=np.float32)
+        vel         = np.array(state['vel'], dtype=np.float32)
+        direction   = np.array(state['dir'], dtype=np.float32)
+        up          = np.array(state['up'],  dtype=np.float32)
+        current_speed = np.linalg.norm(vel)
 
-            # ── 1. 航点距离与通过判定 ─────────────────────────────────────
-            target, _    = self._get_current_targets()
-            rel_goal     = target - pos
-            dist_to_goal = float(np.linalg.norm(rel_goal))
+        target, _    = self._get_current_targets()
+        rel_goal     = target - pos
+        dist_to_goal = float(np.linalg.norm(rel_goal))
 
-            if dist_to_goal < self.wp_radius:
-                self.current_wp_index += 1
-                reward += 1.0  # 阶段性通过奖励
+        stuck_flag = " [STUCK WARNING]" if self.stuck_counter > 5 else ""
+        print(f"Step: {self.current_step_count:3d} | "
+              f"Steer: {steering:5.2f} | "
+              f"Thr: {throttle:4.2f} | "
+              f"Brk: {brake:4.2f} | "
+              f"Speed: {current_speed:5.2f} m/s | "
+              f"Dist: {dist_to_goal:5.1f} m | "
+              f"WP: {self.current_wp_index}{stuck_flag}")
 
-                if self.current_wp_index >= self.num_waypoints:
-                    reward += 5.0  # 全程完成大奖
-                    done = True
-                    info['termination'] = 'success'
-                    break
+        if dist_to_goal < self.wp_radius:
+            self.current_wp_index += 1
+            reward += 1.0 
 
-                # 更新到下一个航点，保证后续奖励计算连贯
+            if self.current_wp_index >= self.num_waypoints:
+                reward += 5.0 
+                done = True
+                info['termination'] = 'success'
+            else:
                 target, _    = self._get_current_targets()
                 rel_goal     = target - pos
                 dist_to_goal = float(np.linalg.norm(rel_goal))
 
-            goal_dir = rel_goal / (dist_to_goal + 1e-6)
+        goal_dir = rel_goal / (dist_to_goal + 1e-6)
+        proj_vel   = float(np.dot(vel, goal_dir))
+        
+        # A. 速度奖励
+        reward_vel = 0.6 * float(np.tanh(max(0.0, proj_vel) / V_REF))
 
-            # ── 2. 朝向计算（后续多处复用）───────────────────────────────
-            heading_dot = float(np.dot(direction[:2], goal_dir[:2]))
+        # C. 存活奖励
+        reward_survival = 0.1
 
-            # ── A. 速度奖励：鼓励朝目标方向提速，tanh 保证数值有界 ────────
-            proj_vel   = float(np.dot(vel, goal_dir))
-            reward_vel = 0.6 * float(np.tanh(max(0.0, proj_vel) / V_REF))
+        reward += reward_vel + reward_survival
 
-            # ── B. 朝向奖励：权重从 0.3 提升到 0.5，压制倒车行为 ──────────
-            reward_heading = max(0.0, heading_dot) * 0.5
+        # E. 低速惩罚
+        if proj_vel < 2.0 and self.current_step_count > 25: # 25步 = 2.5秒免罚
+            reward -= 0.2
 
-            # ── C. 存活奖励 ────────────────────────────────────────────────
-            reward_survival = 0.1
+        # ── 移除倒车惩罚，鼓励智能体自行倒车脱困 ──
+        # if proj_vel < -0.5: 
+        #     reward -= 0.5
 
-            reward += reward_vel + reward_heading + reward_survival
+        # F. 放宽的碰撞判定
+        current_damage = float(damage_data['damage'])
+        delta_damage   = current_damage - self._prev_damage
+        self._prev_damage = current_damage
 
-            # ── D. 进度奖励：方向正确时权重更高（修复原代码重复叠加 bug）──
-            progress = self.prev_dist - dist_to_goal
-            if heading_dot > 0.5:
-                reward += progress * 2.0   # 方向正确，全额进度奖励
-            else:
-                reward += progress * 0.2   # 方向错误，大幅削减进度奖励
-
-            # ── E. 惩罚项 ─────────────────────────────────────────────────
-            # 同时踩油门和刹车
-            if throttle > 0.1 and brake > 0.1:
-                reward -= 0.05 * (throttle + brake)
-
-            # 车速过低（< 3.6 km/h）：抵消存活奖励，惩罚原地徘徊
-            if proj_vel < 1.0:
-                reward -= 0.1
-
-            # 倒车惩罚：速度方向与目标方向相反
-            if proj_vel < 0.0:
-                reward -= 0.2
-
-            # ── F. 碰撞判定 ────────────────────────────────────────────────
-            current_damage = float(damage_data['damage'])
-            delta_damage   = current_damage - self._prev_damage
-            self._prev_damage = current_damage
-
-            if delta_damage > 0:
-                if delta_damage < 50.0:
-                    reward -= 0.2             # 轻微擦碰，扣分但不中断
-                    info['minor_hit'] = True
-                else:
-                    reward = -1.0             # 严重碰撞，终止本 episode
-                    done   = True
-                    info['termination'] = 'collision'
-                    break
-
-            # ── G. 翻车判定 ────────────────────────────────────────────────
-            if up[2] < 0.0:
-                reward = -1.0
+        if delta_damage > 0:
+            # 阈值提高到 5000，防止原地轰油门或轻微托底导致回合结束
+            if delta_damage > 5000.0:
+                reward -= 1.0             
                 done   = True
-                info['termination'] = 'rollover'
-                break
+                info['termination'] = 'collision'
+            else:
+                reward -= 0.05 # 仅给予微小惩罚            
+                info['minor_hit'] = True
 
-            # 更新 prev_dist（放在循环内，保证每个子步都能正确计算进度）
-            self.prev_dist = dist_to_goal
+        # G. 翻车判定
+        if up[2] < 0.0:
+            reward = -1.0
+            done   = True
+            info['termination'] = 'rollover'
+            
+        # ── H. 强制防卡死保护 ──
+        # 只要车停了（无论踩不踩刹车），统统算作卡死累计
+        if self.current_step_count > 25 and current_speed < 0.5:
+            self.stuck_counter += 1
+        else:
+            self.stuck_counter = 0
+
+        # 连续 20 步 (物理时间 2 秒) 卡在原地，重罚并结束
+        if self.stuck_counter > 20:
+            reward -= 2.0  
+            done = True
+            info['termination'] = 'stuck'
+
+        self.prev_dist = dist_to_goal
 
         obs    = self._get_obs()
-        reward = float(np.clip(reward, -1.0, 5.0))
+        reward = float(np.clip(reward, -2.5, 5.0)) # 放宽 reward 下限裁剪以容纳重罚
 
         info['dist_to_goal'] = float(dist_to_goal)
         info['current_wp']   = self.current_wp_index
         info['success']      = (self.current_wp_index >= self.num_waypoints)
-        info['speed'] = float(current_speed)
-
+        info['speed']        = float(current_speed)
+        
         return obs, reward, done, info
 
     def render(self, width=384, height=384, camera_id=None):

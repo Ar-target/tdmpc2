@@ -88,6 +88,7 @@ class OnlineTrainer(Trainer):
 					eval_next = False
 
 				if self._step > 0:
+					# 禁止在“非 episodic 模式”下出现 terminated 状态，否则直接报错
 					if info['terminated'] and not self.cfg.episodic:
 						raise ValueError('Termination detected but you are not in episodic mode. ' \
 						'Set `episodic=true` to enable support for terminations.')
