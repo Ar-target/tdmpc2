@@ -1,328 +1,169 @@
-import json
-import os
-from collections import defaultdict
+# gym.Wrapper
+# class Wrapper(
+#     Env[WrapperObsType, WrapperActType],
+#     Generic[WrapperObsType, WrapperActType, ObsType, ActType],
+# ):
+#     def __init__(self, env: Env[WrapperObsType, WrapperActType]):
+#         """Wraps an environment to allow a modular transformation of the :meth:`step` and :meth:`reset` methods.
+
+#         Args:
+#             env: The environment to wrap
+#         """
+#         self.env = env
+#         assert isinstance(env, Env), (
+#             f"Expected env to be a `gymnasium.Env` but got {type(env)}"
+#         )
+
+#         self._action_space: spaces.Space[WrapperActType] | None = None
+#         self._observation_space: spaces.Space[WrapperObsType] | None = None
+#         self._metadata: dict[str, Any] | None = None
+
+#         self._cached_spec: EnvSpec | None = None
+
 import gymnasium as gym
 import numpy as np
 import torch
-from beamngpy import BeamNGpy, Scenario, Vehicle
-from beamngpy.sensors import Damage
+
 from envs.wrappers.timeout import Timeout
+from envs.tasks import offroad_driving
+from collections import defaultdict, deque
 
-# 状态维度: pos(3) + vel(3) + dir(3) + up(3) + rel_goal(3) + next_rel_goal(3)
-OBS_DIM = 18
+# override
+# 计算环境中所有观测项的总维度，并将其统一为一个扁平化的形状
+def get_obs_shape(env):
+	obs_shp = []
+	for v in env.observation_spec().values():
+		try:
+			shp = np.prod(v.shape)
+		except:
+			shp = 1
+		obs_shp.append(shp)
+	return (int(np.sum(obs_shp)),)
 
-# 动作维度：steering, acc_pedal (目标加速度踏板：正为油门，负为刹车)
-ACT_DIM = 2
+# class ActionScaleWrapper(gym.ActionWrapper):
+#     """
+#     将底层环境的动作空间缩放到指定的范围 (默认是 [-1, 1])。
+#     智能体输出 [-1, 1] 的动作，该 Wrapper 会自动将其还原为底层物理引擎真实的动作范围。
+#     """
+#     def __init__(self, env):
+#         super().__init__(env)
+        
+#         # 记录底层环境真实的动作边界
+#         self.env_low = self.env.action_space.low
+#         self.env_high = self.env.action_space.high
 
-
-def get_obs_from_state(
-    state: dict,
-    current_goal: np.ndarray,
-    next_goal: np.ndarray,
-) -> np.ndarray:
-    pos           = np.array(state['pos'], dtype=np.float32)   # (3,)
-    vel           = np.array(state['vel'], dtype=np.float32)   # (3,)
-    direction     = np.array(state['dir'], dtype=np.float32)   # (3,)
-    up            = np.array(state['up'],  dtype=np.float32)   # (3,) 向上向量，用于判断翻车
-    rel_goal      = current_goal - pos                          # (3,) 当前航点相对向量
-    next_rel_goal = next_goal    - pos                          # (3,) 前瞻航点相对向量
-    return np.concatenate([pos, vel, direction, up, rel_goal, next_rel_goal])
-
-
-# ---------------------------------------------------------------------------
-# OU 噪声：用于 seed 阶段生成时间相关的平滑随机动作
-# ---------------------------------------------------------------------------
-class OUNoise:
-    def __init__(self, action_dim: int, mu: float = 0.0,
-                 theta: float = 0.15, sigma: float = 0.2):
-        self.mu    = mu
-        self.theta = theta
-        self.sigma = sigma
-        self.state = np.zeros(action_dim, dtype=np.float32)
-
-    def reset(self):
-        self.state = np.zeros_like(self.state)
-
-    def sample(self) -> np.ndarray:
-        dx = self.theta * (self.mu - self.state) + \
-             self.sigma * np.random.randn(len(self.state)).astype(np.float32)
-        self.state += dx
-        return self.state.copy()
-
+#     def action(self, action):
+#         """
+#         在 env.step(action) 被调用前，这个函数会自动拦截并转换 action。
+#         """
+#         # 1. 安全裁剪：防止神经网络输出的动作由于浮点误差略微超出 [minimum, maximum]
+#         action = np.clip(action, -1.0, 1.0)
+        
+#         # 2. 线性映射公式：将动作从 [-1, 1] 映射回真实的 [env_low, env_high]
+#         # (action - min) / (max - min) 会得到一个 0 到 1 之间的比例
+#         norm_action = (action + 1.0) / 2
+        
+#         # 根据比例计算真实的物理动作值
+#         scaled_action = self.env_low + norm_action * (self.env_high - self.env_low)
+        
+#         return scaled_action
 
 class BeamNGWrapper:
+    def __init__(self, env):
+        self.env = env
 
-    # seed 阶段的子策略列表
-    _EXPLORE_MODES       = ['straight', 'turn_left', 'turn_right', 'brake']
-    EXPLORE_SWITCH_STEPS = 20
-
-    def __init__(self, cfg):
-        self.cfg = cfg
-
-        # ── 1. 加载越野航点 JSON ──────────────────────────────────────────
-        wp_file = os.path.join(
-            os.path.dirname(__file__), '../data/utah_offroad_waypoints.json'
-        )
-        with open(wp_file, 'r') as f:
-            wp_data = json.load(f)
-
-        self.waypoints = [
-            np.array([wp['x'], wp['y'], wp['z']], dtype=np.float32)
-            for wp in wp_data['waypoints']
-        ]
-        self.wp_radius     = wp_data.get('waypoint_reach_radius', 4.0)
-        self.num_waypoints = len(self.waypoints)
-
-        # ── 2. 追踪进度 ──────────────────────────────────────────
-        self.current_wp_index = 1
-
-        # ── 3. 启动 BeamNG ───────────────────────────────────────────────
-        self.bng = BeamNGpy(
-            host=cfg.beamng_host,
-            port=cfg.beamng_port,
-            home=cfg.beamng_home,
-        )
-        self.bng.open(launch=True)
-        self._setup_scenario()
-
-        # ── 4. 状态追踪变量 ───────────────────────────────────────────────
-        self._prev_damage = 0.0
-        self.prev_dist    = None   
-        self.current_step_count = 0
-        self.stuck_counter = 0
-
-        # ── 5. seed 阶段探索辅助 ──────────────────────────────────────────
-        self._ou_noise        = OUNoise(ACT_DIM)
-        self._explore_mode    = 'straight'
-        self._explore_counter = 0
-
-        # ── 6. 空间定义 (2D 动作空间) ────────────────────────────
+        # 状态与动作形状获取
+        obs_shape = get_obs_shape(self.env)
+        action_shape = self.env.action_spec().shape
+        
+        # 定义观测空间
         self.observation_space = gym.spaces.Box(
-            low=-np.inf, high=np.inf, shape=(OBS_DIM,), dtype=np.float32
-        )
+			low=np.full(obs_shape, -np.inf, dtype=np.float32),
+			high=np.full(obs_shape, np.inf, dtype=np.float32),
+			dtype=np.float32)
+        
+        # 定义动作空间
         self.action_space = gym.spaces.Box(
-            low =np.array([-1.0, -1.0], dtype=np.float32), 
-            high=np.array([ 1.0,  1.0], dtype=np.float32), 
-            dtype=np.float32,
-        )
+			low=np.full(action_shape, self.env.action_spec().minimum),
+			high=np.full(action_shape, self.env.action_spec().maximum),
+			dtype=env.action_spec().dtype)
+        
+        # 提取并存储环境定义的动作数据类型
+        # self.action_spec_dtype = self.env.action_spec().dtype
 
-    # -----------------------------------------------------------------------
-    # 内部工具
-    # -----------------------------------------------------------------------
+    def step(self, action):
+        # action = action.astype(self.action_spec_dtype)
+        state_obs, reward, done, info = self.env.step(action)
+        return state_obs, reward, done, info
 
-    def _setup_scenario(self):
-        self.scenario = Scenario(self.cfg.map, 'rl_scenario')
-        self.vehicle  = Vehicle('ego', model=self.cfg.vehicle_model, licence='RL')
-
-        self.damage_sensor = Damage()
-        self.vehicle.sensors.attach('damage', self.damage_sensor)
-
-        self.scenario.add_vehicle(
-            self.vehicle,
-            pos=tuple(self.cfg.start_pos),
-            rot_quat=tuple(self.cfg.start_rot),
-        )
-        self.scenario.make(self.bng)
-        self.bng.load_scenario(self.scenario)
-        self.bng.start_scenario()
-        self.bng.pause()
-
-    def _get_current_targets(self):
-        target   = self.waypoints[self.current_wp_index]
-        next_idx = min(self.current_wp_index + 1, self.num_waypoints - 1)
-        return target, self.waypoints[next_idx]
-
-    def _get_obs(self) -> torch.Tensor:
-        self.vehicle.sensors.poll()
-        state               = self.vehicle.state
-        target, next_target = self._get_current_targets()
-        obs_array           = get_obs_from_state(state, target, next_target)
-        return torch.from_numpy(obs_array).float()
-
-    # -----------------------------------------------------------------------
-    # 公开接口
-    # -----------------------------------------------------------------------
-
+    # override
     @property
     def unwrapped(self):
-        return self.bng
+        return self.env
 
-    def seed_action(self) -> np.ndarray:
-        self._explore_counter += 1
-        if self._explore_counter % self.EXPLORE_SWITCH_STEPS == 0:
-            self._explore_mode = np.random.choice(self._EXPLORE_MODES)
-
-        mode_actions = {
-            'straight'  : np.array([ 0.0,  0.8], dtype=np.float32),
-            'turn_left' : np.array([-0.4,  0.6], dtype=np.float32),
-            'turn_right': np.array([ 0.4,  0.6], dtype=np.float32),
-            'brake'     : np.array([ 0.0, -0.8], dtype=np.float32),
-        }
-        base  = mode_actions[self._explore_mode]
-        noise = self._ou_noise.sample() * np.array([0.2, 0.1], dtype=np.float32)
-        action = np.clip(base + noise,
-                         self.action_space.low,
-                         self.action_space.high)
-        return action
-
-    def reset(self) -> torch.Tensor:
-        self.bng.restart_scenario()
-        self.bng.pause()
-
-        # 强制挂入 1 档（越野推荐）或 D 档，踩死刹车，等待齿轮咬合
-        self.vehicle.control(gear=1, throttle=0.0, brake=1.0, parkingbrake=0.0)
-        self.bng.step(60) 
-
-        self._prev_damage       = 0.0
-        self.current_wp_index   = 1
-        self._ou_noise.reset()
-        self._explore_counter   = 0
-        self._explore_mode      = 'straight'
-        self.current_step_count = 0  
-        self.stuck_counter      = 0
-
-        self.vehicle.sensors.poll()
-        pos             = np.array(self.vehicle.state['pos'], dtype=np.float32)
-        target, _       = self._get_current_targets()
-        self.prev_dist  = float(np.linalg.norm(target - pos))
-
-        return self._get_obs()
-
-    def step(self, action: np.ndarray):
-        self.current_step_count += 1
+class Multimodal(gym.Wrapper):
+    def __init__(self, env, num_frames=3):
+        super().__init__(env)
+        self._frames = deque([], maxlen=num_frames)
         
-        # ── 1D 踏板解析 ──
-        steering = float(np.clip(action[0], -1.0, 1.0))
-        pedal    = float(np.clip(action[1], -1.0, 1.0))
-
-        if pedal > 0:
-            throttle = pedal
-            brake    = 0.0
-        else:
-            throttle = 0.0
-            brake    = -pedal 
-
-        reward = 0.0
-        done   = False
-        info   = {}
-
-        V_REF = 20.0 
-
-        # ── 10Hz 控制频率 (0.1秒物理步长) ──
-        # 有效过滤探索早期的纯随机高频噪声
-        self.vehicle.control(steering=steering, throttle=throttle, brake=brake)
-        self.bng.step(50)  
-        self.vehicle.sensors.poll()
-
-        state       = self.vehicle.state
-        damage_data = self.vehicle.sensors['damage']
-        pos         = np.array(state['pos'], dtype=np.float32)
-        vel         = np.array(state['vel'], dtype=np.float32)
-        direction   = np.array(state['dir'], dtype=np.float32)
-        up          = np.array(state['up'],  dtype=np.float32)
-        current_speed = np.linalg.norm(vel)
-
-        target, _    = self._get_current_targets()
-        rel_goal     = target - pos
-        dist_to_goal = float(np.linalg.norm(rel_goal))
-
-        stuck_flag = " [STUCK WARNING]" if self.stuck_counter > 5 else ""
-        print(f"Step: {self.current_step_count:3d} | "
-              f"Steer: {steering:5.2f} | "
-              f"Thr: {throttle:4.2f} | "
-              f"Brk: {brake:4.2f} | "
-              f"Speed: {current_speed:5.2f} m/s | "
-              f"Dist: {dist_to_goal:5.1f} m | "
-              f"WP: {self.current_wp_index}{stuck_flag}")
-
-        if dist_to_goal < self.wp_radius:
-            self.current_wp_index += 1
-            reward += 1.0 
-
-            if self.current_wp_index >= self.num_waypoints:
-                reward += 5.0 
-                done = True
-                info['termination'] = 'success'
-            else:
-                target, _    = self._get_current_targets()
-                rel_goal     = target - pos
-                dist_to_goal = float(np.linalg.norm(rel_goal))
-
-        goal_dir = rel_goal / (dist_to_goal + 1e-6)
-        proj_vel   = float(np.dot(vel, goal_dir))
+        # 1. 获取底层 BeamNGWrapper 扁平化后的物理向量空间
+        state_space = self.env.observation_space
         
-        # A. 速度奖励
-        reward_vel = 0.6 * float(np.tanh(max(0.0, proj_vel) / V_REF))
+        # 2. 重新定义观测空间为一个字典 (Dict)
+        self.observation_space = gym.spaces.Dict({
+            'rgb': gym.spaces.Box(
+                low=0.0, high=1.0, shape=(num_frames * 3, 64, 64), dtype=np.float32
+            ),
+            'state': state_space  
+        })
 
-        # C. 存活奖励
-        reward_survival = 0.1
-
-        reward += reward_vel + reward_survival
-
-        # E. 低速惩罚
-        if proj_vel < 2.0 and self.current_step_count > 25: # 25步 = 2.5秒免罚
-            reward -= 0.2
-
-        # ── 移除倒车惩罚，鼓励智能体自行倒车脱困 ──
-        # if proj_vel < -0.5: 
-        #     reward -= 0.5
-
-        # F. 放宽的碰撞判定
-        current_damage = float(damage_data['damage'])
-        delta_damage   = current_damage - self._prev_damage
-        self._prev_damage = current_damage
-
-        if delta_damage > 0:
-            # 阈值提高到 5000，防止原地轰油门或轻微托底导致回合结束
-            if delta_damage > 5000.0:
-                reward -= 1.0             
-                done   = True
-                info['termination'] = 'collision'
-            else:
-                reward -= 0.05 # 仅给予微小惩罚            
-                info['minor_hit'] = True
-
-        # G. 翻车判定
-        if up[2] < 0.0:
-            reward = -1.0
-            done   = True
-            info['termination'] = 'rollover'
-            
-        # ── H. 强制防卡死保护 ──
-        # 只要车停了（无论踩不踩刹车），统统算作卡死累计
-        if self.current_step_count > 25 and current_speed < 0.5:
-            self.stuck_counter += 1
-        else:
-            self.stuck_counter = 0
-
-        # 连续 20 步 (物理时间 2 秒) 卡在原地，重罚并结束
-        if self.stuck_counter > 20:
-            reward -= 2.0  
-            done = True
-            info['termination'] = 'stuck'
-
-        self.prev_dist = dist_to_goal
-
-        obs    = self._get_obs()
-        reward = float(np.clip(reward, -2.5, 5.0)) # 放宽 reward 下限裁剪以容纳重罚
-
-        info['dist_to_goal'] = float(dist_to_goal)
-        info['current_wp']   = self.current_wp_index
-        info['success']      = (self.current_wp_index >= self.num_waypoints)
-        info['speed']        = float(current_speed)
-        
+    def step(self, action):
+        state_obs, reward, done, info = self.env.step(action)
+        obs = self._get_obs(state_obs)
         return obs, reward, done, info
-
-    def render(self, width=384, height=384, camera_id=None):
-        raise NotImplementedError('rgb 模式请在 cfg 中配置 Camera 传感器。')
-
-    def close(self):
-        self.bng.close()
-
+    
+    def reset(self):
+        # 拿到底层重置后的物理状态向量
+        state_obs = self.env.reset()
+        obs = self._get_obs(state_obs, is_reset=True)
+        return obs
+    
+    def _get_obs(self, state_obs, is_reset=False):
+        frame = self.env.render().transpose(2, 0, 1) # 转换为 TD-MPC 期望的 CHW 格式
+        img_tensor = frame.astype(np.float32) / 255.0 # 归一化到 [0, 1]
+        
+        # 如果是 reset，用第一帧填满整个双端队列
+        num_frames = self._frames.maxlen if is_reset else 1
+        for _ in range(num_frames):
+            self._frames.append(img_tensor)
+            
+        # 拼接图像帧 (9, 64, 64)
+        stacked_images = torch.from_numpy(np.concatenate(self._frames))
+        
+        # 将图像和底层的状态向量一起打包成字典返回
+        return {
+            'rgb': stacked_images,
+            'state': state_obs  
+        }
 
 def make_env(cfg):
-    if not cfg.task.startswith('beamng-'):
-        raise ValueError(f'Not a BeamNG task: {cfg.task}')
-    env = BeamNGWrapper(cfg)
+    task_name = cfg.task
+
+    # 只能观测状态值或者rgb图像
+    # assert cfg.obs in {'state', 'rgb'}, 'This task only supports state and rgb observations.'
+    
+    # 初始化特定任务的物理仿真环境
+    TASK_MAP = {
+        'cruise': offroad_driving.cruise,
+        'obstacle_avoidance': offroad_driving.obstacle_avoidance
+    }
+    if task_name not in TASK_MAP:
+        raise ValueError(f'Unknown BeamNG task: {task_name}')
+    
+    env = TASK_MAP[task_name](cfg)
+    # env = ActionScaleWrapper(env)
+    # env = BeamNGWrapper(env)
+    env = Multimodal(env)
     env = Timeout(env, max_episode_steps=cfg.episode_length)
+    
     return env

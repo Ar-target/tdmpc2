@@ -9,11 +9,12 @@ from envs.wrappers.tensor import TensorWrapper
 def missing_dependencies(task):
 	raise ValueError(f'Missing dependencies for task {task}; install dependencies to use this environment.')
 
-try:
-	from envs.beamng import make_env as make_beamng_env
-except:
-	make_beamng_env = missing_dependencies
+# try:
+# 	from envs.beamng import make_env as make_beamng_env
+# except:
+# 	make_beamng_env = missing_dependencies
 
+from envs.beamng import make_env as make_beamng_env
 
 warnings.filterwarnings('ignore', category=DeprecationWarning)
 
@@ -41,13 +42,8 @@ def make_env(cfg):
 	if cfg.multitask:
 		env = make_multitask_env(cfg)
 	else:
-		env = None
-		if env is None and cfg.task.startswith('beamng-'):
-			env = make_beamng_env(cfg)
-		
-		if env is None:
-			raise ValueError(f'Failed to make environment "{cfg.task}": please verify that dependencies are installed and that the task exists.')
-		env = TensorWrapper(env)
+		env = make_beamng_env(cfg)
+		env = TensorWrapper(env) # 将环境包装成支持 Tensor 数据格式（适配 PyTorch）
 	try: # Dict
 		cfg.obs_shape = {k: v.shape for k, v in env.observation_space.spaces.items()}
 	except: # Box

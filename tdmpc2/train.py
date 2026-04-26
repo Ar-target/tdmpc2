@@ -29,7 +29,7 @@ def train(cfg: dict):
 	Script for training single-task / multi-task TD-MPC2 agents.
 
 	Most relevant args:
-		`task`: task name (or mt30/mt80 for multi-task training)
+		`task`: task name
 		`model_size`: model size, must be one of `[1, 5, 19, 48, 317]` (default: 5)
 		`steps`: number of training/environment steps (default: 10M)
 		`seed`: random seed (default: 1)

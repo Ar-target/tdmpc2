@@ -54,7 +54,8 @@ class OnlineTrainer(Trainer):
 	def to_td(self, obs, action=None, reward=None, terminated=None):
 		"""Creates a TensorDict for a new episode."""
 		if isinstance(obs, dict):
-			obs = TensorDict(obs, batch_size=(), device='cpu')
+			obs = {k: v.unsqueeze(0).cpu() for k, v in obs.items()}
+			obs = TensorDict(obs, batch_size=(1,), device='cpu')
 		else:
 			obs = obs.unsqueeze(0).cpu()
 		if action is None:
@@ -77,7 +78,7 @@ class OnlineTrainer(Trainer):
 		while self._step <= self.cfg.steps:
 			# Evaluate agent periodically
 			if self._step % self.cfg.eval_freq == 0:
-				eval_next = True
+				eval_next = False
 
 			# Reset environment
 			if done:
@@ -115,12 +116,10 @@ class OnlineTrainer(Trainer):
 			if self._step > self.cfg.seed_steps:
 				action = self.agent.act(obs, t0=len(self._tds)==1)
 			else:
-				if hasattr(self.env.unwrapped, 'seed_action'):
-					action = torch.tensor(self.env.unwrapped.seed_action(), dtype=torch.float32)
-				else:
-					action = self.env.rand_act()
+				action = self.env.seed_act()
+				if isinstance(action, np.ndarray):
+					action = torch.from_numpy(action)
 			obs, reward, done, info = self.env.step(action)
-			print(f"DEBUG | Action: {action} | Reward: {reward:.3f} | Done: {done} | Speed: {info.get('speed', 'N/A')}")
 			self._tds.append(self.to_td(obs, action, reward, info['terminated']))
 
 			# Update agent
