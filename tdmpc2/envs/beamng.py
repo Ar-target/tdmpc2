@@ -149,10 +149,6 @@ class Multimodal(gym.Wrapper):
 def make_env(cfg):
     task_name = cfg.task
 
-    # 只能观测状态值或者rgb图像
-    # assert cfg.obs in {'state', 'rgb'}, 'This task only supports state and rgb observations.'
-    
-    # 初始化特定任务的物理仿真环境
     TASK_MAP = {
         'cruise': offroad_driving.cruise,
         'obstacle_avoidance': offroad_driving.obstacle_avoidance
@@ -161,8 +157,6 @@ def make_env(cfg):
         raise ValueError(f'Unknown BeamNG task: {task_name}')
     
     env = TASK_MAP[task_name](cfg)
-    # env = ActionScaleWrapper(env)
-    # env = BeamNGWrapper(env)
     env = Multimodal(env)
     env = Timeout(env, max_episode_steps=cfg.episode_length)
     

@@ -43,12 +43,13 @@ def make_env(cfg):
 		env = make_multitask_env(cfg)
 	else:
 		env = make_beamng_env(cfg)
-		env = TensorWrapper(env) # 将环境包装成支持 Tensor 数据格式（适配 PyTorch）
+		env = TensorWrapper(env)
 	try: # Dict
 		cfg.obs_shape = {k: v.shape for k, v in env.observation_space.spaces.items()}
 	except: # Box
 		cfg.obs_shape = {cfg.get('obs', 'state'): env.observation_space.shape}
 	cfg.action_dim = env.action_space.shape[0]
 	cfg.episode_length = env.max_episode_steps
-	cfg.seed_steps = max(1000, 5*cfg.episode_length)
+	# cfg.seed_steps = max(1000, 5*cfg.episode_length)
+	cfg.seed_steps = 500
 	return env

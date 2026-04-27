@@ -171,9 +171,7 @@ class BeamNGPhysics:
         )
 
         self.vehicle.queue_lua_command('controller.getMainController().setIgnitionLevel(2)')
-
         self.vehicle.set_shift_mode('arcade')
-
         self.vehicle.control(throttle=0.0, brake=0.0, parkingbrake=0.0)
         self.bng.step(10)
         self.vehicle.sensors.poll()
@@ -215,6 +213,7 @@ class OffroadDrivingTask:
     def reset_task(self):
         self.current_wp_index = 1
         self.current_step_count = 0
+        self.stuck_steps = 0
         self._info = {}
 
     def get_state_observation(self, physics: BeamNGPhysics) -> dict:
@@ -244,20 +243,36 @@ class OffroadDrivingTask:
             'terminated': False   
         }
 
+        speed_threshold = 0.5   # 速度阈值：低于 0.5 m/s 视为停滞
+        max_stuck_steps = 50    # 容忍的最大连续停滞步数（根据你的步长调整，50步约几秒钟）
+
+        if physics.speed < speed_threshold:
+            self.stuck_steps += 1
+        else:
+            self.stuck_steps = 0  # 只要车动起来了，计数器立刻清零
+
+        # 如果连续停滞超过上限，直接结束回合
+        if self.stuck_steps >= max_stuck_steps:
+            reward -= 1.0        # 给予停滞惩罚，防止 AI 学会“消极怠工”
+            done = True
+            info['terminated'] = True
+            info['success'] = False
+            return float(reward), done, info
+
         current_dist = np.linalg.norm(self.target_pos - self.car_pos)
 
         if hasattr(self, 'last_dist'):
             dist_reduction = self.last_dist - current_dist
-            reward += np.tanh(dist_reduction / 2) * 10.0
+            reward += np.tanh(dist_reduction / 2) * 1.0
 
         if self.car_up[2] < 0.0:
-            reward -= 100.0
+            reward -= 1.0
             done = True
             info['terminated'] = True
             return float(reward), done, info
 
         if current_dist < 3:
-            reward += 100.0
+            reward += 1.0
             self.current_wp_index += 1
             
             if self.current_wp_index < self.num_waypoints:
@@ -315,6 +330,10 @@ class BeamNGEnvironment(gym.Env):
     def step(self, action):
         if isinstance(action, torch.Tensor):
             action = action.detach().cpu().numpy()
+
+        if np.isnan(action).any():
+            print("🚨 警告: 神经网络输出了 NaN! 动作已强制清零。请检查奖励是否过大。")
+            action = np.zeros_like(action)
         
         action = np.clip(action.flatten(), -1.0, 1.0)
         steering = float(action[0])
@@ -341,7 +360,7 @@ class BeamNGEnvironment(gym.Env):
     def reset(self) -> np.ndarray:
         self.physics.reset()
         self.task.reset_task()
-        self._step_count = 0
+        self.step_count = 0
         state_obs = self.task.get_state_observation(self.physics)
         state_obs = self.state_obs_to_array(state_obs)
         return state_obs

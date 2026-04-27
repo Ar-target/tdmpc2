@@ -18,8 +18,9 @@ steps_per_second: 10
 # ============================================================
 # agent training
 # ============================================================
-seed_steps: 5000
 steps: 10_000_000 # 10M
+episode_length: 500
+seed_steps: ???
 buffer_size: 30_000
 batch_size: 256
 horizon: 15
@@ -27,8 +28,8 @@ consistency_coef: 20
 reward_coef: 0.1
 value_coef: 0.1
 termination_coef: 1
-grad_clip_norm: 20
 
+grad_clip_norm: 20
 lr: 3e-4
 enc_lr_scale: 0.3
 tau: 0.01
@@ -63,7 +64,6 @@ vmin: -5
 vmax: 80
 rho: 0.5
 
-
 # ============================================================
 # architecture
 # ============================================================
@@ -78,14 +78,18 @@ num_q: 5
 dropout: 0.01
 simnorm_dim: 8
 
-
-
-
 # ============================================================
 # environment
 # ============================================================
 task: cruise
 episodic: true
+
+
+
+
+
+
+
 
 # ============================================================
 # planning
@@ -137,6 +141,5 @@ task_title: ???
 tasks: ???
 
 action_dim: 2 # 动作维度: 方向盘 [-1, 1], 目标加速度踏板 [-1, 1]
-episode_length: 500
 
 

@@ -97,30 +97,23 @@ class TDMPC2(torch.nn.Module):
 
 	@torch.no_grad()
 	def act(self, obs, t0=False, eval_mode=False, task=None):
-		"""
-		Select an action by planning in the latent space of the world model.
-
-		Args:
-			obs (torch.Tensor): Observation from the environment.
-			t0 (bool): Whether this is the first observation in the episode.
-			eval_mode (bool): Whether to use the mean of the action distribution.
-			task (int): Task index (only used for multi-task experiments).
-
-		Returns:
-			torch.Tensor: Action to take in the environment.
-		"""
 		if isinstance(obs, dict):
 			obs = {k: v.to(self.device, non_blocking=True).unsqueeze(0) for k, v in obs.items()}
 		else:
 			obs = obs.to(self.device, non_blocking=True).unsqueeze(0)
+		
 		if task is not None:
 			task = torch.tensor([task], device=self.device)
+		
 		if self.cfg.mpc:
 			return self.plan(obs, t0=t0, eval_mode=eval_mode, task=task).cpu()
+		
 		z = self.model.encode(obs, task)
 		action, info = self.model.pi(z, task)
+
 		if eval_mode:
 			action = info["mean"]
+		
 		return action[0].cpu()
 
 	@torch.no_grad()

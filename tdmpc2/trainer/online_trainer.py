@@ -58,18 +58,23 @@ class OnlineTrainer(Trainer):
 			obs = TensorDict(obs, batch_size=(1,), device='cpu')
 		else:
 			obs = obs.unsqueeze(0).cpu()
+		
 		if action is None:
 			action = torch.full_like(self.env.rand_act(), float('nan'))
+		
 		if reward is None:
 			reward = torch.tensor(float('nan'))
+		
 		if terminated is None:
 			terminated = torch.tensor(float('nan'))
+		
 		td = TensorDict(
 			obs=obs,
 			action=action.unsqueeze(0),
 			reward=reward.unsqueeze(0),
 			terminated=terminated.unsqueeze(0),
 		batch_size=(1,))
+		
 		return td
 
 	def train(self):
@@ -93,6 +98,7 @@ class OnlineTrainer(Trainer):
 					if info['terminated'] and not self.cfg.episodic:
 						raise ValueError('Termination detected but you are not in episodic mode. ' \
 						'Set `episodic=true` to enable support for terminations.')
+					
 					train_metrics.update(
 						episode_reward=torch.tensor([td['reward'] for td in self._tds[1:]]).sum(),
 						episode_success=info['success'],
@@ -100,13 +106,6 @@ class OnlineTrainer(Trainer):
 						episode_terminated=info['terminated'])
 					train_metrics.update(self.common_metrics())
 					self.logger.log(train_metrics, 'train')
-					print(
-						f"[Step {self._step}] "
-						f"Ep {self._ep_idx} | "
-						f"Reward: {train_metrics['episode_reward']:.1f} | "
-						f"Length: {train_metrics['episode_length']} | "
-						f"Terminated: {train_metrics['episode_terminated']}"
-					)
 					self._ep_idx = self.buffer.add(torch.cat(self._tds))
 
 				obs = self.env.reset()
@@ -119,6 +118,7 @@ class OnlineTrainer(Trainer):
 				action = self.env.seed_act()
 				if isinstance(action, np.ndarray):
 					action = torch.from_numpy(action)
+			
 			obs, reward, done, info = self.env.step(action)
 			self._tds.append(self.to_td(obs, action, reward, info['terminated']))
 

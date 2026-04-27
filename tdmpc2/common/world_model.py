@@ -7,6 +7,8 @@ from common import layers, math, init
 from tensordict import TensorDict
 from tensordict.nn import TensorDictParams
 
+import copy
+
 
 class WorldModel(nn.Module):
 	"""
@@ -17,11 +19,12 @@ class WorldModel(nn.Module):
 	def __init__(self, cfg):
 		super().__init__()
 		self.cfg = cfg
-		if cfg.multitask:
-			self._task_emb = nn.Embedding(len(cfg.tasks), cfg.task_dim, max_norm=1)
-			self.register_buffer("_action_masks", torch.zeros(len(cfg.tasks), cfg.action_dim))
-			for i in range(len(cfg.tasks)):
-				self._action_masks[i, :cfg.action_dims[i]] = 1.
+		# if cfg.multitask:
+		# 	self._task_emb = nn.Embedding(len(cfg.tasks), cfg.task_dim, max_norm=1)
+		# 	self.register_buffer("_action_masks", torch.zeros(len(cfg.tasks), cfg.action_dim))
+		# 	for i in range(len(cfg.tasks)):
+		# 		self._action_masks[i, :cfg.action_dims[i]] = 1.
+		# self._encoder = layers.enc(cfg)
 		self._encoder = layers.enc(cfg)
 		self._dynamics = layers.mlp(cfg.latent_dim + cfg.action_dim + cfg.task_dim, 2*[cfg.mlp_dim], cfg.latent_dim, act=layers.SimNorm(cfg))
 		self._reward = layers.mlp(cfg.latent_dim + cfg.action_dim + cfg.task_dim, 2*[cfg.mlp_dim], max(cfg.num_bins, 1))
@@ -107,12 +110,32 @@ class WorldModel(nn.Module):
 		"""
 		if self.cfg.multitask:
 			obs = self.task_emb(obs, task)
-		# if self.cfg.obs == 'rgb' and obs.ndim == 5:
-		# 	return torch.stack([self._encoder[self.cfg.obs](o) for o in obs])
-		# return self._encoder[self.cfg.obs](obs)
-		if isinstance(obs, dict):
-			z_rgb = self._encoder['rgb'](obs['rgb'])
+		# if self.cfg.obs == 'multimodal':
+		# 	z_rgb = self._encoder['rgb'](obs['rgb'])
+		# 	z_state = self._encoder['state'](obs['state'])
+		# 	return z_rgb + z_state
+		if self.cfg.obs == 'multimodal':
+            # ================= 处理 RGB 图像 (CNN) =================
+			x_rgb = obs['rgb']
+			is_5d = x_rgb.dim() == 5
+
+			if is_5d:
+				# 记录原来的时间跨度 T 和 批次大小 B
+				T, B = x_rgb.shape[:2]
+				# 展平前两维: (T, B, C, H, W) -> (T*B, C, H, W)
+				x_rgb = x_rgb.view(T * B, *x_rgb.shape[2:])
+				
+			# 过 CNN 网络提取特征
+			z_rgb = self._encoder['rgb'](x_rgb)
+
+			if is_5d:
+				# 提完特征后再恢复形状: (T*B, Latent_Dim) -> (T, B, Latent_Dim)
+				z_rgb = z_rgb.view(T, B, -1)
+
+			# ================= 处理状态向量 (MLP) =================
+			# MLP 自带多维支持，直接前向传播即可
 			z_state = self._encoder['state'](obs['state'])
+
 			return z_rgb + z_state
 		else:
 			return self._encoder[self.cfg.obs](obs)
